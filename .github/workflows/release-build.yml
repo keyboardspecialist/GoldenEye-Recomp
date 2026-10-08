@@ -92,7 +92,7 @@ jobs:
         run: cmake --preset linux-amd64-release
 
       - name: Build Release
-        run: cmake --build --preset linux-amd64-release --parallel 2
+        run: cmake --build --preset linux-amd64-release --parallel "$(nproc --all)"
 
       - name: Package executable and runtime libraries
         run: |
