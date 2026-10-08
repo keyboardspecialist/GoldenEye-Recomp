@@ -173,6 +173,11 @@ uint8_t* ge_readable_end(uint8_t* start, size_t requested) {
 }
 }  // namespace
 
+// The title/intro's `bc 20,lt,0x820F285C` has BO=20: it tests neither CR nor
+// CTR, does not decrement CTR, and has no link-register effect. The configured
+// jump replaces the unsupported instruction with that unconditional branch.
+void ge_title_unconditional_branch() {}
+
 // sub_821898D0 obtains the display dimensions from these globals at startup,
 // caches them at sp+120/sp+112, and later passes the cached pair to
 // sub_82099B40 to create the full-frame color/depth resolve textures. The

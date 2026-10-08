@@ -46,6 +46,14 @@
 # watch-volume save continuations (CE enters the save routine past its clamp)
 0x82184E18 = { name = "ge_cont_82184E18" }
 0x82184E48 = { name = "ge_cont_82184E48" }
+# ReXGlue 0.10 does not emit the title/intro's `bc 20,lt,0x820F285C`.
+# BO=20 ignores both CR and CTR, so replace it with its unconditional target.
+[[midasm_hook]]
+address = 0x820F2838
+name = "ge_title_unconditional_branch"
+registers = []
+after_instruction = false
+jump_address = 0x820F285C
 [[midasm_hook]]
 address = 0x82198C94
 name = "ge_dbg_now"
