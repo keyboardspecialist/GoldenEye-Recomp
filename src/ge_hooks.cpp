@@ -25,6 +25,12 @@
 #include <rex/system/xthread.h>
 #include <rex/system/kernel_state.h>
 #include <cstdio>
+#include <rex/memory/utils.h>
+#include <rex/ui/window.h>
+#include <array>
+#include <algorithm>
+#include <filesystem>
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -33,6 +39,13 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>  // ShellExecuteW (WIN32_LEAN_AND_MEAN excludes it)
+#else
+#include <spawn.h>
+#include <unistd.h>
+#include <fstream>
+#include <vector>
+extern char** environ;
+#endif
 #include <string>
 
 namespace ge {
@@ -42,6 +55,7 @@ namespace ge {
 // the current process down. Launching a second instance of a running exe is fine
 // on Windows -- the image file is opened share-read.
 void LaunchSelfDetached() {
+#ifdef _WIN32
   wchar_t exe_path[MAX_PATH];
   DWORD n = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
   if (n == 0 || n >= MAX_PATH) {
@@ -53,6 +67,30 @@ void LaunchSelfDetached() {
   std::wstring workdir = (slash == std::wstring::npos) ? std::wstring() : full.substr(0, slash);
   ShellExecuteW(nullptr, L"open", exe_path, nullptr,
                 workdir.empty() ? nullptr : workdir.c_str(), SW_SHOWNORMAL);
+#else
+  std::error_code ec;
+  auto exe = std::filesystem::read_symlink("/proc/self/exe", ec).string();
+  if (ec) return;
+  // Preserve arguments (especially --game_data_root) and the working directory.
+  std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+  std::vector<std::string> args;
+  for (std::string arg; std::getline(cmdline, arg, '\0');) args.push_back(std::move(arg));
+  if (args.empty()) args.push_back(exe);
+  args[0] = exe;
+  std::vector<char*> argv;
+  for (auto& arg : args) argv.push_back(arg.data());
+  argv.push_back(nullptr);
+  posix_spawnattr_t attr;
+  int error = posix_spawnattr_init(&attr);
+  if (error) return;
+#ifdef POSIX_SPAWN_SETSID
+  error = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+#endif
+  pid_t pid;
+  if (!error) error = posix_spawn(&pid, exe.c_str(), nullptr, &attr, argv.data(), environ);
+  posix_spawnattr_destroy(&attr);
+  if (error) REXKRNL_ERROR("GE restart failed: {}", std::strerror(error));
+#endif
 }
 }  // namespace ge
 
@@ -117,6 +155,18 @@ inline uint16_t LD16(uint8_t* b, uint32_t ga) {
 }
 inline void ST16(uint8_t* b, uint32_t ga, uint16_t val) {
   uint16_t v = __builtin_bswap16(val); std::memcpy(b + ga, &v, 2);
+}
+// Bound diagnostic stack reads to the readable host mapping on either OS.
+uint8_t* ge_readable_end(uint8_t* start, size_t requested) {
+  size_t page_offset = reinterpret_cast<uintptr_t>(start) % rex::memory::page_size();
+  size_t length = requested;
+  rex::memory::PageAccess access;
+  if (!rex::memory::QueryProtect(start - page_offset, length, access) ||
+      (access != rex::memory::PageAccess::kReadOnly &&
+       access != rex::memory::PageAccess::kReadWrite &&
+       access != rex::memory::PageAccess::kExecuteReadOnly &&
+       access != rex::memory::PageAccess::kExecuteReadWrite)) return start;
+  return start + std::min(length > page_offset ? length - page_offset : 0, requested);
 }
 }  // namespace
 
@@ -258,14 +308,8 @@ void ge_watchdog_thread() {
               uint32_t sp = c->r1.u32;
               if (sp >= 0x10000u && sp < 0xC0000000u) {
                 uint8_t* hsp = base + sp;
-                MEMORY_BASIC_INFORMATION mbi;
-                if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-                    mbi.State == MEM_COMMIT &&
-                    (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) {
-                  uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-                  uint8_t* send = hsp + 0x2400u;
-                  if (send > rend) send = rend;  // never read past the committed page
+                uint8_t* send = ge_readable_end(hsp, 0x2400u);
+                if (send > hsp) {
                   char sbuf[500];
                   int soff = 0;
                   sbuf[0] = 0;
@@ -351,12 +395,8 @@ void ge_watchdog_thread() {
                   int fo = std::snprintf(fb, sizeof(fb), "lr=%x | ", pc);
                   if (sp >= 0x10000u && sp < 0xC0000000u) {
                     uint8_t* hsp = base + sp;
-                    MEMORY_BASIC_INFORMATION mbi;
-                    if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-                        mbi.State == MEM_COMMIT) {
-                      uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-                      uint8_t* send = hsp + 0x2800u;
-                      if (send > rend) send = rend;
+                    uint8_t* send = ge_readable_end(hsp, 0x2800u);
+                    if (send > hsp) {
                       for (uint8_t* pp = hsp; pp + 4 <= send && fo < 580; pp += 4) {
                         uint32_t v;
                         std::memcpy(&v, pp, 4);
@@ -712,6 +752,7 @@ std::atomic<bool> g_mouselook_suppressed{false};  // set true while the pause me
 std::atomic<bool> g_rebind_capturing{false};
 
 // Cursor-capture state (touched from the mouse thread + SetMouselookSuppressed).
+#ifdef _WIN32
 HWND g_game_hwnd = nullptr;
 HCURSOR g_arrow_cursor = nullptr;
 HCURSOR g_blank_cursor = nullptr;
@@ -850,17 +891,127 @@ void ge_start_mouse_once() {
     std::thread(ge_mouse_thread).detach();
   }
 }
+#else
+std::atomic<bool> g_game_focused{false};
+std::array<std::atomic<bool>, 256> g_keys{};
+
+bool ge_game_has_focus() { return g_game_focused.load(std::memory_order_relaxed); }
+bool ge_mouse_active() {
+  return REXCVAR_GET(ge_mouselook_enable) && ge_game_has_focus() &&
+         !g_mouselook_suppressed.load(std::memory_order_relaxed);
+}
+
+// All window operations and event callbacks run on the SDK's UI thread.
+class GeInputListener : public rex::ui::WindowListener, public rex::ui::WindowInputListener {
+ public:
+  rex::ui::Window* window = nullptr;
+  bool captured = false;
+  float pending_x = 0, pending_y = 0;
+
+  void UpdateCapture() {
+    if (!window) return;
+    bool want = ge_mouse_active();
+    if (want == captured) return;
+    captured = want && window->SetRelativeMouseMode(true);
+    if (!want) window->SetRelativeMouseMode(false);
+    window->SetCursorVisibility(captured ? rex::ui::Window::CursorVisibility::kHidden
+                                        : rex::ui::Window::CursorVisibility::kVisible);
+    pending_x = pending_y = 0;
+    g_mouse_dx.store(0, std::memory_order_relaxed);
+    g_mouse_dy.store(0, std::memory_order_relaxed);
+  }
+  void OnGotFocus(rex::ui::UISetupEvent&) override {
+    g_game_focused.store(true, std::memory_order_relaxed);
+    UpdateCapture();
+  }
+  void OnLostFocus(rex::ui::UISetupEvent&) override {
+    g_game_focused.store(false, std::memory_order_relaxed);
+    for (auto& key : g_keys) key.store(false, std::memory_order_relaxed);
+    UpdateCapture();
+  }
+  void OnKeyDown(rex::ui::KeyEvent& e) override { SetKeyEvent(e, true); }
+  void OnKeyUp(rex::ui::KeyEvent& e) override { SetKeyEvent(e, false); }
+  void OnMouseDown(rex::ui::MouseEvent& e) override { SetButton(e.button(), true); }
+  void OnMouseUp(rex::ui::MouseEvent& e) override { SetButton(e.button(), false); }
+  void OnMouseMove(rex::ui::MouseEvent& e) override {
+    UpdateCapture();
+    if (!captured) return;
+    pending_x += e.dx();
+    pending_y += e.dy();
+    int dx = static_cast<int>(pending_x), dy = static_cast<int>(pending_y);
+    pending_x -= dx;
+    pending_y -= dy;
+    g_mouse_dx.fetch_add(dx, std::memory_order_relaxed);
+    g_mouse_dy.fetch_add(dy, std::memory_order_relaxed);
+  }
+ private:
+  void SetKeyEvent(rex::ui::KeyEvent& e, bool down) {
+    SetKey(e.virtual_key(), down);
+    // SDL reports left/right modifier keys; binds also accept generic names.
+    SetKey(rex::ui::VirtualKey::kShift, e.is_shift_pressed());
+    SetKey(rex::ui::VirtualKey::kControl, e.is_ctrl_pressed());
+    SetKey(rex::ui::VirtualKey::kMenu, e.is_alt_pressed());
+  }
+  void SetKey(rex::ui::VirtualKey vk, bool down) {
+    auto index = static_cast<size_t>(vk);
+    if (index < g_keys.size()) g_keys[index].store(down, std::memory_order_relaxed);
+  }
+  void SetButton(rex::ui::MouseEvent::Button button, bool down) {
+    using Button = rex::ui::MouseEvent::Button;
+    using Key = rex::ui::VirtualKey;
+    switch (button) {
+      case Button::kLeft: SetKey(Key::kLButton, down); break;
+      case Button::kRight: SetKey(Key::kRButton, down); break;
+      case Button::kMiddle: SetKey(Key::kMButton, down); break;
+      case Button::kX1: SetKey(Key::kXButton1, down); break;
+      case Button::kX2: SetKey(Key::kXButton2, down); break;
+      default: break;
+    }
+  }
+};
+GeInputListener g_input_listener;
+void ge_update_mouse_capture() {
+  if (auto* window = g_input_listener.window) {
+    window->app_context().CallInUIThreadDeferred([] { g_input_listener.UpdateCapture(); });
+  }
+}
+void ge_start_mouse_once() {}  // Linux input is delivered by the UI event loop.
+#endif
 
 int ge_take_mouse_dx() { return g_mouse_dx.exchange(0, std::memory_order_relaxed); }
 int ge_take_mouse_dy() { return g_mouse_dy.exchange(0, std::memory_order_relaxed); }
 }  // namespace
 
 namespace ge {
-// Start the raw-mouse + cursor-capture thread once, at app startup, so capture
+// Initialize platform mouse input at app startup, so capture
 // works regardless of whether the guest look hooks have fired yet.
-void InitMouseLook() {
+void InitMouseLook(rex::ui::Window* window) {
   REXKRNL_INFO("GEMOUSE InitMouseLook (enable={})", REXCVAR_GET(ge_mouselook_enable));
+#ifdef _WIN32
+  (void)window;
   ge_start_mouse_once();
+#else
+  if (!window || g_input_listener.window) return;
+  g_input_listener.window = window;
+  g_game_focused.store(window->HasFocus(), std::memory_order_relaxed);
+  window->AddListener(&g_input_listener);
+  // Observe before ImGui can consume events, without marking them handled.
+  window->AddInputListener(&g_input_listener, SIZE_MAX);
+  g_input_listener.UpdateCapture();
+#endif
+}
+
+void ShutdownMouseLook() {
+#ifndef _WIN32
+  if (auto* window = g_input_listener.window) {
+    g_game_focused.store(false, std::memory_order_relaxed);
+    g_input_listener.UpdateCapture();
+    window->RemoveInputListener(&g_input_listener);
+    window->RemoveListener(&g_input_listener);
+    g_input_listener.window = nullptr;
+    for (auto& key : g_keys) key.store(false, std::memory_order_relaxed);
+  }
+#endif
 }
 
 // Called by the app when the pause menu opens/closes so mouse motion isn't
@@ -1134,7 +1285,12 @@ bool ge_key_down(const char* name) {
     if (!one.empty()) {
       rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(one);
       if (vk != rex::ui::VirtualKey::kNone &&
+#ifdef _WIN32
           (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0)
+#else
+          static_cast<size_t>(vk) < g_keys.size() &&
+          g_keys[static_cast<size_t>(vk)].load(std::memory_order_relaxed))
+#endif
         return true;
     }
     if (comma == std::string::npos) break;

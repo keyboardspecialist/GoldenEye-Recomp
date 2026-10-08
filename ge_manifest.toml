@@ -1,5 +1,5 @@
 [project]
-sdk_version = "0.8.0.0"
+sdk_version = "0.10.0"
 name = "ge"
 
 [entrypoint]
@@ -11,4 +11,3 @@ includes = [
 
 setjmp_address = 0x823F22C0
 longjmp_address = 0x823F1FA0
-
