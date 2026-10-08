@@ -9,7 +9,9 @@ fi
 build_dir="$1"
 output_dir="$2"
 version="$3"
-repo_root="$(git rev-parse --show-toplevel)"
+# Resolve source files from this script's location without consulting Git. The
+# Actions container may run with a different owner from the checkout directory.
+repo_root="$(realpath -- "$(dirname -- "${BASH_SOURCE[0]}")/../..")"
 
 if [[ ! "$version" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "VERSION must contain only letters, numbers, dots, underscores, or hyphens." >&2
