@@ -9,9 +9,13 @@
 // fragment's register/memory effect, tail-invokes the continuation function,
 // and the recompiled source function then returns.
 
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
 #include <rex/cvar.h>  // REXCVAR_* (mouse-look settings)
@@ -27,7 +31,6 @@
 #include <cstdio>
 #include <rex/memory/utils.h>
 #include <rex/ui/window.h>
-#include <array>
 #include <algorithm>
 #include <filesystem>
 #ifdef _WIN32
@@ -169,6 +172,20 @@ uint8_t* ge_readable_end(uint8_t* start, size_t requested) {
   return start + std::min(length > page_offset ? length - page_offset : 0, requested);
 }
 }  // namespace
+
+// sub_821898D0 obtains the display dimensions from these globals at startup,
+// caches them at sp+120/sp+112, and later passes the cached pair to
+// sub_82099B40 to create the full-frame color/depth resolve textures. The
+// intervening initializer chain clobbers the cached slots in the recompiled
+// path (0 and -1), which the XDK header builder encodes as 8192x8191 textures.
+// Their resulting 4 KiB allocations overlap and break the stencil-based body
+// fade composite. Reloading the original source values at the final consumer
+// preserves the retail/Xenia behavior without altering renderer semantics.
+void ge_fix_postfx_resolve_dimensions(PPCRegister& r3, PPCRegister& r4) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  r3.u32 = LD32(base, 0x83093434u);  // display width
+  r4.u32 = LD32(base, 0x83093428u);  // display height
+}
 
 // ===========================================================================
 // Freeze watchdog. Auto-detects the visual freeze (the guest keeps presenting
@@ -1050,6 +1067,12 @@ constexpr uint32_t GE_SETTINGS_PTR  = 0x83088228u;  // -> settings struct pointe
 constexpr uint32_t GE_SETTINGS_BITS = 0x298u;       // bitflags offset in struct
 constexpr uint32_t GE_PLAYER_PTR    = 0x82F1FA98u;  // -> players[0] (host's Bond)
 constexpr uint32_t GE_BONDVIEW_CUR  = 0x82F1FAACu;  // -> currently-controlled view's player
+constexpr uint32_t GE_MUSIC_STATE   = 0x83066750u;  // XBLA mission-music state (0..6)
+constexpr uint32_t GE_STAGE_MUSIC_ID = 0x8306674Cu; // current stage music-table key
+constexpr uint32_t GE_MUSIC_CUES    = 0x83064DF4u;  // three active native music-cue slots
+constexpr uint32_t GE_PENDING_STAGE = 0x82423DFCu;  // boss g_MainStageNum
+constexpr uint32_t GE_CURRENT_STAGE = 0x82423E00u;  // boss g_StageNum
+constexpr uint32_t GE_TITLE_STAGE   = 90u;
 constexpr uint32_t GE_OFF_WATCH     = 0x2E8u;       // watch status (!=0 -> input disabled)
 constexpr uint32_t GE_OFF_DISABLED  = 0x80u;        // control-disabled flag (cutscene)
 constexpr uint32_t GE_OFF_CAM_X     = 0x254u;       // camera yaw
@@ -1060,11 +1083,410 @@ constexpr uint32_t GE_OFF_GUN_X     = 0x10BCu;      // gun X
 constexpr uint32_t GE_OFF_GUN_Y     = 0x10C0u;      // gun Y
 constexpr uint32_t GE_OFF_AIM_MODE  = 0x22Cu;       // aim-mode (1 = aiming)
 constexpr uint32_t GE_OFF_AIM_MULT  = 0x11ACu;      // aim-turn multiplier (slows when zoomed)
+constexpr uint32_t GE_IN_TANK_FLAG  = 0x82F1F8D4u;  // authoritative mounted-state flag
+constexpr uint32_t GE_PLAYER_TANK_PROP = 0x82F1F8DCu;
+constexpr uint32_t GE_TANK_TURRET_RAD  = 0x82F1F900u;
+constexpr uint32_t GE_TANK_TURRET_ACCUM = 0x82F1F904u;
+constexpr uint32_t GE_TANK_TURRET_TARGET = 0x82F1F910u;
+constexpr uint32_t GE_TANK_TURRET_RECIP = 0x82003C64u; // 1 / (1 - smoothing)
 enum GESettingFlag {
   GE_SET_AutoAim   = 0x10,
   GE_SET_LookAhead = 0x80,
 };
+
+// The XBLA AI interpreter recognizes opcodes F4/F5, but its handlers only call
+// printf. They are the original music_xtrack_play/music_xtrack_stop commands.
+// Keep their four-slot timing semantics here, then drive the XBLA mission-music
+// state machine (sub_82144C60), which already performs the native XACT lookup,
+// Track 2 playback, and Track 1 cross-fades from music.xsb/music.xwb.
+struct GEXTrackSlot {
+  bool active = false;
+  double minimum_seconds = 0.0;
+  double total_seconds = 0.0;
+};
+
+std::array<GEXTrackSlot, 4> g_xtrack_slots{};
+std::chrono::steady_clock::time_point g_xtrack_last_tick =
+    std::chrono::steady_clock::now();
+bool g_xtrack_had_player = false;
+uint32_t g_xtrack_last_music_state = UINT32_MAX;
+
+bool ge_any_xtrack_slot_active() {
+  for (const GEXTrackSlot& slot : g_xtrack_slots) {
+    if (slot.total_seconds > 0.0 &&
+        (slot.active || slot.minimum_seconds > 0.0)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void ge_stop_native_music_cue(PPCContext& ctx, uint8_t* base,
+                              uint32_t slot) {
+  ctx.r3.u32 = slot;
+  sub_82144A80(ctx, base);
+}
+
+void ge_start_stage_primary_cue(PPCContext& ctx, uint8_t* base) {
+  // This is the same lookup/play sequence used by sub_82144C60 for a normal
+  // 0 -> 1 mission-music transition, kept here because its 2 -> 1 transition
+  // assumes the (missing) fade code merely left Track 1 running silently.
+  ctx.r3.u32 = LD32(base, GE_STAGE_MUSIC_ID);
+  sub_821453C0(ctx, base);
+  const uint32_t cue_id = ctx.r3.u32;
+  if (static_cast<int32_t>(cue_id) < 0) return;
+  ctx.r3.u32 = 0u;
+  ctx.r4.u32 = cue_id;
+  sub_82144BA8(ctx, base);
+}
+
+void ge_start_stage_secondary_cue(PPCContext& ctx, uint8_t* base) {
+  ctx.r3.u32 = LD32(base, GE_STAGE_MUSIC_ID);
+  // sub_82145518 is the stage-specific X-track lookup used by the native
+  // 1 -> 2 and 4 -> 5 transitions. sub_821454C0 is ambience (slot 2), not the
+  // elevator cue.
+  sub_82145518(ctx, base);
+  const uint32_t cue_id = ctx.r3.u32;
+  if (static_cast<int32_t>(cue_id) < 0) return;
+  ctx.r3.u32 = 1u;
+  ctx.r4.u32 = cue_id;
+  sub_82144BA8(ctx, base);
+}
+
+void ge_set_mission_music_state(PPCContext& source_ctx, uint8_t* base,
+                                uint32_t target_state) {
+  const uint32_t old_state = LD32(base, GE_MUSIC_STATE);
+  if (old_state == target_state) return;
+
+  const bool entering_xtrack =
+      (old_state == 1u && target_state == 2u) ||
+      (old_state == 4u && target_state == 5u);
+  const bool leaving_xtrack =
+      (old_state == 2u && target_state == 1u) ||
+      (old_state == 5u && target_state == 4u);
+
+  // Preserve the AI/input caller's registers. The native PPC function uses the
+  // copied guest context and the real guest stack/memory, just like an ordinary
+  // PPC call, and ultimately reaches the game's existing XACT music manager.
+  PPCContext call_ctx = source_ctx;
+  call_ctx.r3.u32 = target_state;
+  sub_82144C60(call_ctx, base);
+
+  if (entering_xtrack) {
+    // The transition has created Track 2, but its original Track-1 fade call
+    // is a no-op in XBLA. Use the game's well-tested cue-stop wrapper instead.
+    ge_stop_native_music_cue(call_ctx, base, 0u);
+  } else if (leaving_xtrack) {
+    // Its Track-2 fade-out is the same no-op. Stop Track 2, then recreate the
+    // stage's primary cue through the same native lookup/play path used at
+    // mission start. This restarts rather than cross-fades, but stays entirely
+    // within already-exercised game wrappers and avoids unsafe vtable guesses.
+    ge_stop_native_music_cue(call_ctx, base, 1u);
+    ge_start_stage_primary_cue(call_ctx, base);
+  }
+
+  g_xtrack_last_music_state = LD32(base, GE_MUSIC_STATE);
+  REXKRNL_INFO("GEXTRACK state {} -> {} (native cue slot1={:08X})",
+               old_state, LD32(base, GE_MUSIC_STATE),
+               LD32(base, GE_MUSIC_CUES + 4u));
+}
+
+void ge_refresh_xtrack_state(PPCContext& ctx, uint8_t* base) {
+  const uint32_t state = LD32(base, GE_MUSIC_STATE);
+
+  const bool supported_mission_state =
+      state == 1u || state == 2u || state == 4u || state == 5u;
+  const bool prior_state_was_xtrack =
+      g_xtrack_last_music_state == 2u || g_xtrack_last_music_state == 5u;
+  const bool state_was_reset_externally =
+      prior_state_was_xtrack && (state == 1u || state == 4u);
+
+  // Mission abort/restart can retain a valid player pointer while the native
+  // music manager tears down and recreates its cues.  Treat an externally
+  // observed X -> normal transition (or any non-mission music state) as the
+  // lifecycle boundary it is. Otherwise Control's 255-second slot survives a
+  // restart and immediately suppresses the next run's primary level theme.
+  if (!supported_mission_state || state_was_reset_externally) {
+    if (ge_any_xtrack_slot_active()) {
+      g_xtrack_slots = {};
+      REXKRNL_INFO("GEXTRACK cleared stale slots at native state {}", state);
+    }
+    g_xtrack_last_music_state = state;
+    return;
+  }
+
+  g_xtrack_last_music_state = state;
+  const bool wants_xtrack = ge_any_xtrack_slot_active();
+
+  // XBLA states mirror the shipped transition table: 1/4 are normal mission
+  // music without/with ambience; 2/5 are their corresponding X-track states.
+  if (wants_xtrack) {
+    if (state == 1u) ge_set_mission_music_state(ctx, base, 2u);
+    else if (state == 4u) ge_set_mission_music_state(ctx, base, 5u);
+  } else {
+    if (state == 2u) ge_set_mission_music_state(ctx, base, 1u);
+    else if (state == 5u) ge_set_mission_music_state(ctx, base, 4u);
+  }
+}
+
+void ge_xtrack_tick(PPCContext& ctx, uint8_t* base, bool player_active) {
+  const auto now = std::chrono::steady_clock::now();
+  double elapsed = std::chrono::duration<double>(now - g_xtrack_last_tick).count();
+  g_xtrack_last_tick = now;
+
+  if (!player_active) {
+    if (g_xtrack_had_player) {
+      g_xtrack_slots = {};
+      g_xtrack_had_player = false;
+    }
+    g_xtrack_last_music_state = LD32(base, GE_MUSIC_STATE);
+    return;
+  }
+  g_xtrack_had_player = true;
+
+  // The original uses its simulation ClockTimer, so timers do not advance while
+  // paused. Clamp a long host stall as well; loading/alt-tab must not consume an
+  // entire minimum-duration window in one input poll.
+  if (LD32(base, GE_PAUSE_FLAG) != 0u) elapsed = 0.0;
+  if (elapsed > 0.25) elapsed = 0.25;
+
+  if (elapsed > 0.0) {
+    for (GEXTrackSlot& slot : g_xtrack_slots) {
+      if (!slot.active && slot.minimum_seconds <= 0.0) continue;
+      if (slot.minimum_seconds > 0.0) {
+        slot.minimum_seconds -= elapsed;
+        if (slot.minimum_seconds < 0.0) slot.minimum_seconds = 0.0;
+      }
+      if (slot.total_seconds > 0.0) {
+        slot.total_seconds -= elapsed;
+        if (slot.total_seconds <= 0.0) {
+          slot.total_seconds = 0.0;
+          slot.active = false;
+        }
+      }
+    }
+  }
+
+  ge_refresh_xtrack_state(ctx, base);
+}
+
+// The leaked XBLA build contains the authentic watch and Mission Select cues in
+// music.xwb, but several N64 music-script transitions were never wired into
+// this version. Supply those transitions through the game's native XACT music
+// manager from the existing once-per-frame hook; no extracted audio is needed.
+enum class GENativeRestoredMusic {
+  None,
+  MissionSelect,
+  Watch,
+};
+
+GENativeRestoredMusic g_native_restored_music =
+    GENativeRestoredMusic::None;
+
+// Values accepted by sub_82144BA8 are the game's logical music indices, not
+// raw XACT cue indices. The runtime translation table maps 23 -> XACT 11
+// (Mission Select) and 24 -> XACT 32 (watch theme).
+constexpr uint32_t GE_LOGICAL_CUE_MISSION_SELECT = 23u;
+constexpr uint32_t GE_LOGICAL_CUE_WATCH = 24u;
+
+bool ge_start_native_restored_music(PPCContext& source_ctx, uint8_t* base,
+                                    GENativeRestoredMusic kind,
+                                    uint32_t slot, uint32_t logical_cue) {
+  PPCContext call_ctx = source_ctx;
+  call_ctx.r3.u32 = slot;
+  call_ctx.r4.u32 = logical_cue;
+  sub_82144BA8(call_ctx, base);
+  if (LD32(base, GE_MUSIC_CUES + slot * 4u) == 0u) return false;
+  g_native_restored_music = kind;
+  return true;
+}
+
+uint32_t ge_find_active_viewport_player(uint8_t* base) {
+  uint32_t player = 0;
+  for (int i = 0; i < 4; ++i) {
+    uint32_t candidate = LD32(base, GE_PLAYER_PTR + i * 4u);
+    if (candidate && LD32(base, candidate + 0x904u) == 0u) {
+      player = candidate;
+      break;
+    }
+  }
+  return player;
+}
+
+uint32_t ge_find_active_player(uint8_t* base) {
+  uint32_t player = ge_find_active_viewport_player(base);
+  if (!player) player = LD32(base, GE_BONDVIEW_CUR);
+  if (!player) player = LD32(base, GE_PLAYER_PTR);
+  return player;
+}
+
+void ge_missing_music_tick(PPCContext& ctx, uint8_t* base) {
+  static bool previous_watch_open = false;
+  static bool saw_active_non_title_stage = false;
+  static bool title_music_pending = false;
+  static uint32_t title_settle_frames = 0;
+  static uint32_t watch_saved_music_state = 0;
+  static bool watch_stopped_native_tracks = false;
+  const uint32_t active_viewport_player =
+      ge_find_active_viewport_player(base);
+  const uint32_t player = ge_find_active_player(base);
+  const bool player_active = active_viewport_player != 0;
+  const uint32_t music_state = LD32(base, GE_MUSIC_STATE);
+  const uint32_t pending_stage = LD32(base, GE_PENDING_STAGE);
+  const uint32_t current_stage = LD32(base, GE_CURRENT_STAGE);
+  const bool title_requested = current_stage == GE_TITLE_STAGE ||
+                               pending_stage == GE_TITLE_STAGE;
+
+  // The outgoing mission's viewport/player pointers can remain valid while
+  // stage 90 is loading.  Do not let that stale player keep an elevator
+  // X-track timer alive behind Mission Select, where its eventual expiry would
+  // restart the previous stage's primary music.
+  if (title_requested && ge_any_xtrack_slot_active()) {
+    REXKRNL_INFO("GEXTRACK clearing slots for Mission Select transition");
+  }
+  ge_xtrack_tick(ctx, base, player_active && !title_requested);
+
+  // Some XBLA exits write the boss stage globals directly and never call the
+  // N64-style setter. Arm only after an actual player is active in a non-title
+  // stage, then observe either current or pending stage becoming title (90).
+  // This covers abort, failure, and completion without playing on initial boot.
+  if (player_active && current_stage != GE_TITLE_STAGE && !title_requested) {
+    saw_active_non_title_stage = true;
+  }
+
+  if (saw_active_non_title_stage && title_requested) {
+    saw_active_non_title_stage = false;
+    title_music_pending = true;
+    title_settle_frames = 0;
+    REXKRNL_INFO("GEMISSINGMUSIC armed Mission Select cue at stage transition current={} pending={}",
+                 current_stage, pending_stage);
+  }
+
+  // pending=90 is written while the outgoing level is still current. Starting
+  // a cue at that point succeeds, but the subsequent title-stage audio reset
+  // destroys it. Wait until stage 90 has been current for a few input ticks so
+  // the title audio system has finished resetting its native cue slots.
+  if (title_music_pending && current_stage == GE_TITLE_STAGE &&
+      ++title_settle_frames >= 3u) {
+    title_music_pending = false;
+    ge_stop_native_music_cue(ctx, base, 0u);
+    ge_stop_native_music_cue(ctx, base, 1u);
+    g_native_restored_music = GENativeRestoredMusic::None;
+    watch_stopped_native_tracks = false;
+    if (ge_start_native_restored_music(
+            ctx, base, GENativeRestoredMusic::MissionSelect, 0u,
+            GE_LOGICAL_CUE_MISSION_SELECT)) {
+      REXKRNL_INFO("GEMISSINGMUSIC started native XACT Mission Select cue at stage transition current={} pending={}",
+                   current_stage, pending_stage);
+    } else {
+      REXKRNL_ERROR("GEMISSINGMUSIC could not play native Mission Select current={} pending={}",
+                    current_stage, pending_stage);
+    }
+  } else if (!title_requested &&
+             (player_active || music_state != 0u) &&
+             g_native_restored_music == GENativeRestoredMusic::MissionSelect) {
+    // A level's own startup replaces slot 0, so relinquish ownership without
+    // stopping the new stage cue.
+    g_native_restored_music = GENativeRestoredMusic::None;
+  }
+
+  const bool watch_open = player && LD32(base, GE_PAUSE_FLAG) != 0u &&
+                          LD32(base, player + GE_OFF_WATCH) != 0u;
+  if (watch_open == previous_watch_open) return;
+  previous_watch_open = watch_open;
+
+  if (watch_open) {
+    watch_saved_music_state = music_state;
+    watch_stopped_native_tracks = true;
+    ge_stop_native_music_cue(ctx, base, 0u);
+    ge_stop_native_music_cue(ctx, base, 1u);
+    g_native_restored_music = GENativeRestoredMusic::None;
+    if (ge_start_native_restored_music(
+            ctx, base, GENativeRestoredMusic::Watch, 0u,
+            GE_LOGICAL_CUE_WATCH)) {
+      REXKRNL_INFO("GEWATCHMUSIC started native XACT watch cue");
+    } else {
+      REXKRNL_ERROR("GEWATCHMUSIC could not play native watch cue");
+    }
+  } else {
+    const bool had_native_watch =
+        g_native_restored_music == GENativeRestoredMusic::Watch;
+    if (had_native_watch) {
+      ge_stop_native_music_cue(ctx, base, 0u);
+      g_native_restored_music = GENativeRestoredMusic::None;
+    }
+    if (watch_stopped_native_tracks && !title_requested) {
+      PPCContext restore_ctx = ctx;
+      if (watch_saved_music_state == 2u || watch_saved_music_state == 5u ||
+          ge_any_xtrack_slot_active()) {
+        ge_start_stage_secondary_cue(restore_ctx, base);
+        REXKRNL_INFO("GEWATCHMUSIC restored elevator/X-track cue");
+      } else {
+        ge_start_stage_primary_cue(restore_ctx, base);
+        REXKRNL_INFO("GEWATCHMUSIC restored primary level cue");
+      }
+    }
+    watch_stopped_native_tracks = false;
+  }
+}
 }  // namespace
+
+// AI opcode F4: music_xtrack_play(slot, minimum_seconds, total_seconds).
+// The original XBLA block at 0x82135BF0 advances r30 by four bytes and then
+// prints an unimplemented-command message. ge_config.toml skips that whole
+// block, so this hook performs the cursor update as well as the missing action.
+void ge_music_xtrack_play() {
+  PPCContext* ctx;
+  uint8_t* base;
+  getcb(ctx, base);
+
+  const uint32_t command = ctx->r31.u32;
+  const int32_t slot_index = static_cast<int8_t>(base[command + 1u]);
+  const uint8_t minimum_seconds = base[command + 2u];
+  const uint8_t total_seconds = base[command + 3u];
+  ctx->r30.u32 += 4u;
+
+  if (slot_index < 0 || slot_index >= static_cast<int32_t>(g_xtrack_slots.size())) {
+    REXKRNL_ERROR("GEXTRACK ignored F4 with invalid slot {}", slot_index);
+    return;
+  }
+
+  GEXTrackSlot& slot = g_xtrack_slots[static_cast<size_t>(slot_index)];
+  if (!slot.active) {
+    slot.active = true;
+    slot.minimum_seconds = static_cast<double>(minimum_seconds);
+    slot.total_seconds = static_cast<double>(total_seconds);
+    REXKRNL_INFO("GEXTRACK F4 play slot={} minimum={} total={}",
+                 slot_index, minimum_seconds, total_seconds);
+  }
+
+  ge_refresh_xtrack_state(*ctx, base);
+}
+
+// AI opcode F5: music_xtrack_stop(slot). A negative slot means all four slots.
+void ge_music_xtrack_stop() {
+  PPCContext* ctx;
+  uint8_t* base;
+  getcb(ctx, base);
+
+  const uint32_t command = ctx->r31.u32;
+  const int32_t slot_index = static_cast<int8_t>(base[command + 1u]);
+  ctx->r30.u32 += 2u;
+
+  if (slot_index < 0) {
+    g_xtrack_slots = {};
+    REXKRNL_INFO("GEXTRACK F5 stopped all slots");
+  } else if (slot_index < static_cast<int32_t>(g_xtrack_slots.size())) {
+    // Match the original semantics: stopping clears the active flag but leaves
+    // the minimum-duration timer running before the main track may return.
+    g_xtrack_slots[static_cast<size_t>(slot_index)].active = false;
+    REXKRNL_INFO("GEXTRACK F5 stop slot={}", slot_index);
+  } else {
+    REXKRNL_ERROR("GEXTRACK ignored F5 with invalid slot {}", slot_index);
+  }
+
+  ge_refresh_xtrack_state(*ctx, base);
+}
 
 void ge_mouse_camera(uint8_t* base) {
   // Persistent state (= GoldeneyeGame member vars in xenia).
@@ -1082,6 +1504,20 @@ void ge_mouse_camera(uint8_t* base) {
   // Consume this frame's raw mouse delta once; used for both menu and camera.
   const float mdx = static_cast<float>(ge_take_mouse_dx());
   const float mdy = static_cast<float>(ge_take_mouse_dy());
+
+  // Last-used device wins. The camera/crosshair overrides below are for the
+  // mouse; with a controller they fought the game's own stick aiming (aim-mode
+  // pinned the crosshair to the centre every frame, so the right stick barely
+  // moved it) and forced auto-aim/look-ahead off. Mouse movement switches them
+  // on; right-stick movement hands control back to the game.
+  static bool mouse_mode = false;
+  {
+    // slot-0 gamepad (GE_PAD0) right stick, s16 big-endian at +8 / +10
+    const int16_t rx = static_cast<int16_t>(LD16(base, 0x830C8B9Cu + 8));
+    const int16_t ry = static_cast<int16_t>(LD16(base, 0x830C8B9Cu + 10));
+    if (mdx != 0.f || mdy != 0.f) mouse_mode = true;
+    else if (std::abs(rx) > 8000 || std::abs(ry) > 8000) mouse_mode = false;
+  }
 
   // Move the menu selection crosshair (the game's own menus read these).
   {
@@ -1127,7 +1563,7 @@ void ge_mouse_camera(uint8_t* base) {
   // xenia's exact behaviour. (Doing it every frame oscillated against the game's
   // per-frame auto-aim in multiplayer and caused the camera jitter.)
   if (game_pause_flag != prev_pause || game_control_disabled != prev_disabled) {
-    const uint32_t sp = LD32(base, GE_SETTINGS_PTR);
+    const uint32_t sp = mouse_mode ? LD32(base, GE_SETTINGS_PTR) : 0u;
     if (sp) {
       const uint32_t sva = sp + GE_SETTINGS_BITS;
       uint32_t settings = LD32(base, sva);
@@ -1141,6 +1577,41 @@ void ge_mouse_camera(uint8_t* base) {
   }
 
   if (game_control_disabled) return;
+  if (!mouse_mode) return;  // controller: leave aiming to the game
+
+  // The ordinary camera yaw is rebuilt from the tank body + turret every
+  // simulation tick, so writing player->vv_theta (the on-foot mouse path)
+  // cannot turn the tank horizontally. Shift both the native turret target and
+  // its smoothed current value by the same mouse delta instead. This preserves
+  // the game's steering, collision rollback, controller input, and interpolation
+  // while making mouse-X act on the same turret state that native tank controls
+  // ultimately drive. The accumulator uses the reciprocal constant from this
+  // exact XBLA build rather than assuming the N64 smoothing rate.
+  const bool in_tank = LD32(base, GE_IN_TANK_FLAG) == 1u &&
+                       LD32(base, GE_PLAYER_TANK_PROP) != 0u;
+  float look_mdx = mdx;
+  if (in_tank && mdx != 0.f) {
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr float kTau = 2.f * kPi;
+    const float delta_rad =
+        (invert_x ? -1.f : 1.f) * (mdx / 10.f) * sensitivity *
+        (kPi / 180.f);
+    auto wrap_tau = [kTau](float angle) {
+      angle = std::fmod(angle, kTau);
+      if (angle < 0.f) angle += kTau;
+      return angle;
+    };
+
+    const float target =
+        wrap_tau(LDF32(base, GE_TANK_TURRET_TARGET) + delta_rad);
+    const float current =
+        wrap_tau(LDF32(base, GE_TANK_TURRET_RAD) + delta_rad);
+    STF32(base, GE_TANK_TURRET_TARGET, target);
+    STF32(base, GE_TANK_TURRET_RAD, current);
+    STF32(base, GE_TANK_TURRET_ACCUM,
+          current * LDF32(base, GE_TANK_TURRET_RECIP));
+    look_mdx = 0.f;  // do not also write the transient on-foot camera yaw
+  }
 
   const uint32_t aim_mode = LD32(base, player + GE_OFF_AIM_MODE);
   if (aim_mode != prev_aim_mode) {
@@ -1165,10 +1636,10 @@ void ge_mouse_camera(uint8_t* base) {
     // Instead drive the camera straight from the mouse (same feel as hip-fire /
     // v1.2.2) and hold the crosshair + gun centred, so there is nothing for the
     // game to spring back to.
-    if (mdx != 0.f || mdy != 0.f) {
+    if (look_mdx != 0.f || mdy != 0.f) {
       float camX = LDF32(base, player + GE_OFF_CAM_X);
       float camY = LDF32(base, player + GE_OFF_CAM_Y);
-      camX += (invert_x ? -1.f : 1.f) * (mdx / 10.f) * sensitivity;
+      camX += (invert_x ? -1.f : 1.f) * (look_mdx / 10.f) * sensitivity;
       camY -= (invert_y ? -1.f : 1.f) * (mdy / 10.f) * sensitivity;
       STF32(base, player + GE_OFF_CAM_X, camX);
       STF32(base, player + GE_OFF_CAM_Y, camY);
@@ -1198,14 +1669,14 @@ void ge_mouse_camera(uint8_t* base) {
       }
     }
 
-    if (mdx != 0.f || mdy != 0.f) {
+    if (look_mdx != 0.f || mdy != 0.f) {
       float camX = LDF32(base, player + GE_OFF_CAM_X);
       float camY = LDF32(base, player + GE_OFF_CAM_Y);
 
-      camX += (invert_x ? -1.f : 1.f) * (mdx / 10.f) * sensitivity;
+      camX += (invert_x ? -1.f : 1.f) * (look_mdx / 10.f) * sensitivity;
 
       // Add 'sway' to the gun as the camera turns.
-      const float gun_sway_x = ((mdx / 16000.f) * sensitivity) * bounds;
+      const float gun_sway_x = ((look_mdx / 16000.f) * sensitivity) * bounds;
       const float gun_sway_y = ((mdy / 16000.f) * sensitivity) * bounds;
       float gun_sway_x_changed = gX + gun_sway_x;
       float gun_sway_y_changed = gY + gun_sway_y;
@@ -1338,7 +1809,7 @@ void ge_mouse_camera(uint8_t* base);  // defined above
 void ge_apply_ce_data_patches(uint8_t* base);  // ge_ce_patches.cpp
 
 void ge_inject_keyboard(PPCRegister& /*r11*/) {
-  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
 
   // Apply BeanTools community DATA bug-fixes once, before any level loads its
   // setup/fog/BG data. The data segment is live in guest RAM by the first input
@@ -1349,6 +1820,10 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     ge_apply_ce_data_patches(base);
     REXKRNL_INFO("GECE community data bug-fixes applied");
   }
+
+  // Restore missing XBLA music transitions regardless of whether keyboard or
+  // mouse-look support is enabled.
+  ge_missing_music_tick(*ctx, base);
 
   // Rebind capture: the menu is listening for a key to bind. Swallow ALL slot-0
   // controller input (buttons, triggers, both sticks) so the key/button being
@@ -1364,13 +1839,26 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     return;
   }
 
+  const bool keyboard_active = REXCVAR_GET(ge_keyboard_enable) && ge_input_active();
+  if (keyboard_active) {
+    // Right-stick keybinds must be visible to the last-used-device check before
+    // mouse-look runs, so keyboard-only aiming also uses the game's native path.
+    int16_t rx = 0, ry = 0;
+    if (ge_key_down("ge_key_look_left")) rx = -32767;
+    if (ge_key_down("ge_key_look_right")) rx = 32767;
+    if (ge_key_down("ge_key_look_up")) ry = 32767;
+    if (ge_key_down("ge_key_look_down")) ry = -32767;
+    if (rx) ST16(base, GE_PAD0 + 8, static_cast<uint16_t>(rx));
+    if (ry) ST16(base, GE_PAD0 + 10, static_cast<uint16_t>(ry));
+  }
+
   // Mouse look runs every frame here, independent of the keyboard toggle. The
   // raw-mouse thread only accumulates deltas while the game is focused and the
   // cursor is captured, so this is a no-op in menus / when unfocused.
   ge_start_mouse_once();
   if (REXCVAR_GET(ge_mouselook_enable)) ge_mouse_camera(base);
 
-  if (!REXCVAR_GET(ge_keyboard_enable) || !ge_input_active()) return;
+  if (!keyboard_active) return;
 
   uint16_t add = 0;
   if (ge_key_down("ge_key_a")) add |= BTN_A;
@@ -1400,15 +1888,6 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   if (lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(lx));
   if (ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(ly));
 
-  // Right stick (look/aim) -> slot-0 gamepad RX(+8)/RY(+10), s16 BE (#63). Feeds
-  // the guest's native right-stick look, so it coexists with mouse-look.
-  int16_t rx = 0, ry = 0;
-  if (ge_key_down("ge_key_look_left")) rx = -32767;
-  if (ge_key_down("ge_key_look_right")) rx = 32767;
-  if (ge_key_down("ge_key_look_up")) ry = 32767;
-  if (ge_key_down("ge_key_look_down")) ry = -32767;
-  if (rx) ST16(base, GE_PAD0 + 8, static_cast<uint16_t>(rx));
-  if (ry) ST16(base, GE_PAD0 + 10, static_cast<uint16_t>(ry));
 }
 
 // ===========================================================================
@@ -1417,6 +1896,13 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
 // directly). Addresses/values 1:1 with finalizer.c. Data-only CE fixes live in
 // ge_ce_patches.cpp.
 // ===========================================================================
+
+// fix_water_rendering_for_new_graphics @0x8209ECF4: CE NOOPs
+// `lbz r11,-8431(r23)`, which otherwise reloads the HD-graphics flag before
+// the following zero-test and suppresses sub_8214AFC8 (the Frigate water
+// draw). The midasm hook skips that instruction, preserving r11 exactly as a
+// PPC NOP would.
+void ge_ce_water_render() {}
 
 // fix_door_volume_clamp @0x820DD814: `li r3,0` -> `li r3,1` (min volume for
 // distant doors; 0 overflows). After-hook forces r3 = 1.
@@ -1444,6 +1930,12 @@ void ge_ce_near_clip(PPCRegister& r11) {
   PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
   ST32(base, r11.u32 + 0x14u, 0x40000000u);  // 2.0f
 }
+
+// Projection builder sub_8210DFA8 reloads the near clip into f3 immediately
+// before sub_8238B530 constructs the matrix. Pin the live argument as well as
+// the fog global: captures showed the matrix still using 5.0, clipping the
+// Frigate ocean wherever the low camera's view ray hits it within five units.
+void ge_ce_near_clip_projection(PPCRegister& f3) { f3.f64 = 2.0; }
 
 // remove_original_graphics_mode_blur @0x82188E70: CE NOOPs `bne cr6,+0x19C` so
 // the blur path is never taken. Branch-replace -> always fall through.
@@ -1728,4 +2220,98 @@ void ge_ce_watch_sfx_save() {
   PPCContext* ctx; uint8_t* base; getcb(ctx, base);
   ctx->r4.u32 = ctx->r4.u32 + ctx->r4.u32;
   ge_cont_82184E48(*ctx, base);
+}
+
+// ===========================================================================
+// Pause-screen watch arm: show only the current costume's sleeve.
+//
+// The watch arm model (char\suitlfhand) contains every costume's sleeve, and the
+// game's cuff code (sub_820B3168) already switches on the right one through the
+// arm's N64 switches SW_BOILER / SW_DINNER / SW_CONNERY / SW_SUIT / SW_TIMBER /
+// SW_SNOW. The XBLA renderer applies switches to a model through *named
+// conditions*: each frame sub_820997E0 copies every switch's state into the model's
+// condition of the same name (sub_8209D4E8), and the model's draw stream skips
+// geometry wrapped in a COND record (0x17 {id, target}) whose condition bit is off
+// (interpreter sub_823A7330, test sub_8240A5A0). That is how e.g. the PP7's
+// SW_FLASH / SW_FINGER parts work. Rare's arm assets declare no conditions and
+// wrap no geometry in COND, so every sleeve is drawn, stacked on top of each other
+// (tux + snow in HD, tux + green in classic) on every level.
+//
+// Fix: capture the game's own SW_* values for the arm and, while the watch hand is
+// being drawn, skip the draws of each sleeve block whose switch is off -- exactly
+// what the missing CONDs would do. Blocks are counted by BONEPAL (0x13) records.
+// ===========================================================================
+REXCVAR_DEFINE_BOOL(ge_sleeve_fix, true, "Game", "Show only the costume's sleeve on the pause-screen watch arm");
+
+namespace {
+constexpr const char* kSleeveSw[6] = {"SW_BOILER", "SW_DINNER", "SW_CONNERY", "SW_SUIT", "SW_TIMBER", "SW_SNOW"};
+// stream block -> the sleeve switches that show it (bit i = kSleeveSw[i]), 0 = always drawn
+enum : uint8_t { kBoiler = 1, kDinner = 2, kConnery = 4, kSuit = 8, kTimber = 16, kSnow = 32 };
+// HD model (files\new, 11 blocks): 4 tux, 5 jungle, 6 snow, 7 black tactical, 8 suit
+constexpr uint8_t kHdBlockSw[11] = {0, 0, 0, 0, kDinner, kTimber, kSnow, kBoiler, kSuit, 0, 0};
+// classic model (files\original, 22 blocks, N64 display lists in tree order): hand 0-5,
+// boiler 6-7, white shirt cuff 8 (shared by the tux and the suit), tux jacket 9,
+// Connery 10, suit 11, jungle 12, snow 13, watch 14-21
+constexpr uint8_t kClassicBlockSw[22] = {0, 0, 0, 0, 0, 0, kBoiler, kBoiler, kDinner | kSuit, kDinner,
+                                         kConnery, kSuit, kTimber, kSnow, 0, 0, 0, 0, 0, 0, 0, 0};
+std::atomic<int> g_sleeve_sw[6] = {-1, -1, -1, -1, -1, -1};  // -1 unknown, else 0/1
+thread_local bool g_arm_drawing = false;
+thread_local uint32_t g_arm_stream = 0;      // header of the arm stream being drawn
+thread_local uint32_t g_arm_blk_start[33];   // record address of each block (+ end)
+thread_local int g_arm_nblk = 0;
+
+// walk the stream from its header and record where every block starts
+bool ge_sleeve_map_blocks(uint8_t* base, uint32_t stream) {
+  int blk = -1;
+  uint32_t pc = stream + 0x24u;
+  for (int n = 0; n < 4096; n++) {
+    const uint32_t tag = LD32(base, pc), size = tag >> 16, type = (tag >> 8) & 0xFF;
+    if (size < 4 || size > 0x400) return false;
+    if (type == 0x1D) break;                                    // END
+    if (type == 0x13 && ++blk < 32) g_arm_blk_start[blk] = pc;  // BONEPAL opens a block
+    pc += size;
+  }
+  if (blk < 8 || blk >= 32) return false;
+  g_arm_nblk = blk + 1;
+  g_arm_blk_start[g_arm_nblk] = pc;
+  return true;
+}
+}  // namespace
+
+// watch-hand draw (sub_820BE560), around each of its two sub_8209AB98 calls
+void ge_sleeve_draw_begin() { g_arm_drawing = true; g_arm_stream = 0; }
+void ge_sleeve_draw_end() { g_arm_drawing = false; }
+
+// sub_820997E0 @0x82099880, at `bl sub_8209D4E8(hdmodel, name, visible)`: the
+// game's own switch -> condition copy. Remember the arm's sleeve switch values.
+void ge_sleeve_capture_switch(PPCRegister& r4, PPCRegister& r5) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  const char* name = reinterpret_cast<const char*>(base + r4.u32);
+  if (name[0] != 'S' || name[1] != 'W' || name[2] != '_') return;
+  for (int i = 0; i < 6; i++)
+    if (std::strcmp(name, kSleeveSw[i]) == 0) g_sleeve_sw[i].store(r5.u32 ? 1 : 0);
+}
+
+// HD stream interpreter (sub_823A7330) record dispatch @0x823A7390, after
+// `lbz r11,2(r31)`: r11 = record type, r31 = record. true = skip the record.
+bool ge_sleeve_cond(PPCRegister& r11, PPCRegister& r31) {
+  if (!g_arm_drawing || !REXCVAR_GET(ge_sleeve_fix)) return false;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  if (!g_arm_stream) {  // first record of the arm's stream: map its blocks
+    if (LD32(base, r31.u32) != 0x000C0C00u) { g_arm_drawing = false; return false; }
+    g_arm_stream = r31.u32 - 0x24u;
+    if (!ge_sleeve_map_blocks(base, g_arm_stream)) { g_arm_drawing = false; return false; }
+  }
+  const uint32_t type = r11.u32;
+  if (type != 0x01 && type != 0x30) return false;  // only DRAW / DRAWN
+  const uint8_t* map = g_arm_nblk == 11 ? kHdBlockSw : g_arm_nblk == 22 ? kClassicBlockSw : nullptr;
+  if (!map) return false;
+  for (int b = 0; b < g_arm_nblk; b++)
+    if (r31.u32 >= g_arm_blk_start[b] && r31.u32 < g_arm_blk_start[b + 1]) {
+      if (!map[b]) return false;                          // not a sleeve: always drawn
+      for (int i = 0; i < 6; i++)                         // drawn if any owning switch is on
+        if ((map[b] >> i & 1) && g_sleeve_sw[i].load() != 0) return false;
+      return true;                                        // all its switches off -> skip
+    }
+  return false;
 }

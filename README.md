@@ -31,6 +31,25 @@ Anyway, enough of that.
 * Post-processing effects
 * Higher FPS gameplay
 
+### Integrated upstream fixes
+
+* [#118](https://github.com/SunJaycy/GoldenEye-Recomp/pull/118): delayed
+  dead-body fades and animated Frigate water in enhanced graphics, including
+  the low speedboat camera.
+* [#137](https://github.com/SunJaycy/GoldenEye-Recomp/pull/137): the pause-screen
+  watch arm shows only the current costume's sleeve in enhanced and classic
+  graphics. Use `--ge_sleeve_fix=false` to disable this fix.
+* [#138](https://github.com/SunJaycy/GoldenEye-Recomp/pull/138): mouse movement
+  enables mouse aiming; right-stick movement returns aiming to the controller,
+  preserving its native crosshair behavior and auto-aim choice. Keyboard
+  right-stick bindings participate in the same input selection.
+* [#114](https://github.com/SunJaycy/GoldenEye-Recomp/pull/114): native XACT
+  watch music, Control/Caverns elevator music, and Mission Select music after
+  missions, using the existing game music banks.
+* [#116](https://github.com/SunJaycy/GoldenEye-Recomp/pull/116): horizontal
+  mouse aiming for the mounted tank turret while retaining keyboard driving
+  and vertical aiming. Its shared music fixes are included through #114.
+
 ## Online
 
 To play online, someone needs to run a server.
