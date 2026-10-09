@@ -18,6 +18,7 @@
 #include <cstdlib>
 
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
+#include "ge_menu_input.h"
 #include <rex/cvar.h>  // REXCVAR_* (mouse-look settings)
 #include <rex/ui/keybinds.h>     // ParseVirtualKey (keyboard rebinding)
 #include <rex/ui/virtual_key.h>
@@ -1731,6 +1732,9 @@ void ge_mouse_camera(uint8_t* base) {
 // Slot-0 gamepad buffer (filled by XamInputGetState in ge_input_poll_controllers,
 // Xbox360 big-endian): +0 buttons(u16), +2 LT, +3 RT, +4 LX(s16), +6 LY(s16).
 // ===========================================================================
+REXCVAR_DEFINE_DOUBLE(ge_menu_button_debounce, 0.15, "Input",
+                     "Minimum time between repeated menu button presses in seconds").range(0.0, 1.0);
+
 namespace {
 constexpr uint32_t GE_PAD0 = 0x830C8B9Cu;  // unk_830C8B9C, slot-0 gamepad
 
@@ -1773,6 +1777,25 @@ bool ge_key_down(const char* name) {
     start = comma + 1;
   }
   return false;
+}
+
+void ge_filter_menu_controller_input(uint8_t* base) {
+  static std::array<ge::MenuButtonDebounce, 4> debounce;
+  const uint32_t player = ge_find_active_player(base);
+  // Stage 90 contains the file/mission/difficulty/multiplayer menus. During a
+  // mission, filter only while the game's own watch menu is open.
+  const bool menu_active = !g_mouselook_suppressed.load(std::memory_order_relaxed) &&
+      ge_game_has_focus() &&
+      (LD32(base, GE_CURRENT_STAGE) == GE_TITLE_STAGE ||
+       (player && LD32(base, GE_PAUSE_FLAG) != 0u &&
+        LD32(base, player + GE_OFF_WATCH) != 0u));
+  const double now = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  const double cooldown = REXCVAR_GET(ge_menu_button_debounce);
+  for (size_t i = 0; i < debounce.size(); ++i) {
+    const uint32_t pad = GE_PAD0 + static_cast<uint32_t>(i) * 16u;
+    ST16(base, pad, debounce[i].Filter(LD16(base, pad), menu_active, now, cooldown));
+  }
 }
 }  // namespace
 
@@ -1863,7 +1886,10 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   ge_start_mouse_once();
   if (REXCVAR_GET(ge_mouselook_enable)) ge_mouse_camera(base);
 
-  if (!keyboard_active) return;
+  if (!keyboard_active) {
+    ge_filter_menu_controller_input(base);
+    return;
+  }
 
   uint16_t add = 0;
   if (ge_key_down("ge_key_a")) add |= BTN_A;
@@ -1893,6 +1919,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   if (lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(lx));
   if (ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(ly));
 
+  ge_filter_menu_controller_input(base);
 }
 
 // ===========================================================================

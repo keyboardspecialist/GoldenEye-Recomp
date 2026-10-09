@@ -100,6 +100,10 @@ If you want to build from source you'll need:
    install your GPU's Vulkan driver and the X11/Wayland runtime libraries.
    Keyboard/mouse input uses the SDK's SDL window events and relative mouse mode.
 
+   Rapid duplicate presses of the same controller button in title/watch menus
+   are ignored for 150 ms after an accepted press. Tune this with
+   `--ge_menu_button_debounce=0.15` (seconds), or set it to `0` to disable.
+
    Use `--resolution=1080p` (or `--resolution=1920x1080`) to select a window/video
    mode. `--window_width=1280 --window_height=720` sets the window size independently.
    The in-game **Internal Resolution** setting controls `resolution_scale` and
